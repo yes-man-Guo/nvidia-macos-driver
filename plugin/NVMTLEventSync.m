@@ -312,7 +312,12 @@ static int nvmtl_skip_empty_on(void) {
     _reservation = nil;
 }
 - (void)nvmtlSealPartWithSignal:(id)event value:(uint64_t)value restart:(BOOL)restart {
-    if (!_parts) _parts = [NSMutableArray new];
+    // _parts is shared state: the execution worker (nvmtlAdvancePart, the default async commit path) indexes it
+    // and writes into it without this lock. Sealing happens before commit and the worker only starts once the
+    // commit has published the buffer under this lock, so the two never overlap in practice — the lock makes
+    // that local instead of relying on the commit's barrier (issue #251). Short sections only: nothing below
+    // waits for the GPU while it is held.
+    @synchronized ([NVMTLCommandBuffer class]) { if (!_parts) _parts = [NSMutableArray new]; }
     nvmtl_g79_flush(self);
     NVMTLSubmissionPart *part = [NVMTLSubmissionPart new];
     part->commands = _c;
@@ -325,7 +330,7 @@ static int nvmtl_skip_empty_on(void) {
     part->scratch = [_scratch copy]; part->signalEvent = event; part->value = value;
     part->encoders = _nEnc - _nEncSealed; _nEncSealed = _nEnc;
     if (_g79Sig.count) { part->signals = [_g79Sig copy]; [_g79Sig removeAllObjects]; }
-    [_parts addObject:part];
+    @synchronized ([NVMTLCommandBuffer class]) { [_parts addObject:part]; }
     [_surfDirty removeAllObjects]; [_scratch removeAllObjects];
     // The repeated-setBytes cache points at ring chunks without owning them; the part now owns those chunks and frees
     // them when it completes, which can happen while this command buffer is still being encoded. A cache entry that
@@ -360,7 +365,8 @@ static int nvmtl_skip_empty_on(void) {
     }
     [self nvmtlSealPartWithSignal:nil value:0 restart:YES];
     NVMTLSubmissionPart *part = [NVMTLSubmissionPart new];
-    part->waitEvent = event; part->value = value; [_parts addObject:part];
+    part->waitEvent = event; part->value = value;
+    @synchronized ([NVMTLCommandBuffer class]) { [_parts addObject:part]; }
 }
 - (void)nvmtlRecordSignal:(id)event value:(uint64_t)value {
     if (!event || _committed) return;
@@ -613,10 +619,17 @@ static void nvmtl_gsub_ahead_pass1(void) {
 - (BOOL)nvmtlAdvancePart {
     if (_executionDone) return NO;
     if (_cbError) { [self nvmtlFinishExecution:_cbError]; return YES; }
-    if (_nextPart >= _parts.count) { [self nvmtlFinishExecution:nil]; return YES; }
-    NVMTLSubmissionPart *part = _parts[_nextPart];
-    BOOL ahead;   // claimed under the class lock: the commit-time pass stops at a claimed part
-    @synchronized ([NVMTLCommandBuffer class]) { ahead = part->inflight || part->aheadFailed; part->claimed = YES; }
+    // The array is read and written under the command-buffer class lock, the same lock the seal and the
+    // submit-ahead pass already take: _parts must never be indexed or written while a seal can append to it
+    // (issue #251). The GPU submit in between deliberately runs outside it. The claim (2.3.7: the commit-time
+    // ahead pass stops at claimed parts) is taken under the same lock, together with the read — no window.
+    NVMTLSubmissionPart *part;
+    BOOL ahead = NO;
+    @synchronized ([NVMTLCommandBuffer class]) {
+        part = _nextPart < _parts.count ? _parts[_nextPart] : nil;
+        if (part) { ahead = part->inflight || part->aheadFailed; part->claimed = YES; }
+    }
+    if (!part) { [self nvmtlFinishExecution:nil]; return YES; }
     if (part->waitEvent && !ahead && !part->waitFolded) {
         if (![part->waitEvent respondsToSelector:@selector(signaledValue)]) {
             [self nvmtlFinishExecution:[NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal
@@ -681,8 +694,12 @@ static void nvmtl_gsub_ahead_pass1(void) {
         }
         ((void(*)(id,SEL,uint64_t))objc_msgSend)(event, @selector(setSignaledValue:), [s[1] unsignedLongLongValue]);
     }
-    _parts[_nextPart++] = [NSNull null];
-    if (_nextPart == _parts.count) { nvtrace("COMPLETE cb %p t=%llu", (__bridge void *)self, (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000));
+    BOOL complete;
+    @synchronized ([NVMTLCommandBuffer class]) {
+        _parts[_nextPart++] = [NSNull null];
+        complete = _nextPart == _parts.count;
+    }
+    if (complete) { nvtrace("COMPLETE cb %p t=%llu", (__bridge void *)self, (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000));
         [self nvmtlFinishExecution:nil]; }
     return YES;
 }

@@ -167,9 +167,24 @@ static inline void nvmtl_resref(id o, int d) {
 - (id)member:(id)o { os_unfair_lock_lock(&_lk); id m = [_s member:o]; os_unfair_lock_unlock(&_lk); return m; }
 - (NSArray *)nvmtlSnapshot { os_unfair_lock_lock(&_lk); NSArray *a = _s.allObjects; os_unfair_lock_unlock(&_lk); return a; }
 - (NSEnumerator *)objectEnumerator { return [[self nvmtlSnapshot] objectEnumerator]; }
-// for-in runs only over a command buffer part's own copy (one thread), never over a set still being encoded into
+// Enumeration hands out a snapshot, never the live set — the rule -nvmtlSnapshot and -objectEnumerator already
+// follow (10-07 crash report, RTX 5060 Ti: Hackintool died in -[__NSSetM member:] under -addObject:). A for-in
+// used to walk _s itself, on the strength of the comment that used to sit here ("only over a part's own copy"):
+// issue #251 (UURemote, 100% reproducible) died in objc_opt_isKindOfClass inside nvmtl_submission_copies on a
+// member the set no longer owned, and take-all / clear swap the backing set under _lk — a walk that grabbed the
+// old storage keeps pointers into storage its new owner re-uses. The snapshot is taken once per enumeration,
+// under _lk, and kept for its duration in the fast-enumeration state. Nothing in the driver breaks out of a
+// for-in over a resource set early (the walks in nvmtl_submission_copies and the restart re-add in
+// nvmtlSealPartWithSignal:restart: both run to the end), so the state-held snapshot always reaches its release.
 - (NSUInteger)countByEnumeratingWithState:(NSFastEnumerationState *)st objects:(id __unsafe_unretained [])b count:(NSUInteger)n {
-    return [_s countByEnumeratingWithState:st objects:b count:n]; }
+    if (st->state == 0 && st->itemsPtr == NULL) {
+        if (st->extra[0]) { NSArray *stale = (__bridge_transfer NSArray *)(void *)st->extra[0]; (void)stale; st->extra[0] = 0; }
+        st->extra[0] = (unsigned long)CFBridgingRetain([self nvmtlSnapshot]);
+    }
+    NSArray *snap = (__bridge NSArray *)(void *)st->extra[0];
+    NSUInteger r = [snap countByEnumeratingWithState:st objects:b count:n];
+    if (r == 0 && st->extra[0]) { NSArray *done = (__bridge_transfer NSArray *)(void *)st->extra[0]; (void)done; st->extra[0] = 0; }
+    return r; }
 // _mru: objects added lately, each in the set until it is removed (the set retains it, so its address cannot be reused
 // while it is listed). Encoders add the same few buffers, pipelines and samplers draw after draw (Apple's GL rebinds its
 // vertex, index and uniform buffers for every draw), and a hit skips the set's hash lookup.
