@@ -1675,7 +1675,26 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
             if (nvrm && sym) nvrm->callPlatformFunction(sym, false, &q, nullptr, nullptr, nullptr);
             if (sym) sym->release();
             st = q.status; usec = q.usec; ok = st == 0;
-            if (st == 0x65u) mayUnwire = false;
+            if (st == 0x65u) {
+                // The RM's spin budget (200k) can expire while the copy engine is still busy under load; the
+                // op keeps running and lands moments later. Unwiring immediately could free pages the engine
+                // is still writing - but never unwiring leaked wire references until the surface's pages were
+                // freed from under them (vm_page_validate_no_references panics, 2026-10-18/20, RTX 3080 +
+                // UURemote). The engine serializes ops, so re-issuing the copy waits out the previous one:
+                // two extra budgets, then unwire regardless.
+                int retry = 0;
+                for (; retry < 2 && st == 0x65u; retry++) {
+                    IOSleep(1);
+                    IOService *nvrm2 = nvAccelNVRM();
+                    const OSSymbol *sym2 = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF);
+                    if (nvrm2 && sym2) nvrm2->callPlatformFunction(sym2, false, &q, nullptr, nullptr, nullptr);
+                    if (sym2) sym2->release();
+                    st = q.status; usec += q.usec;
+                }
+                mayUnwire = true;   // a leaked wire panicked every later teardown of these pages
+                if (st == 0x65u) ALOG("surfvram pageoff: res %p CE copy still timed out after 2 retries -- unwiring anyway (%llu B)", this, len);
+                else if (retry) { ok = st == 0; ALOG("surfvram pageoff: res %p CE copy landed on retry %d (%llu B)", this, retry, len); }
+            }
         }
         IOFree(pa, pages * sizeof *pa);
     }
